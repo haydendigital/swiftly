@@ -27,6 +27,13 @@ muted_object_headers     The headers to omit when outputting object
                          response headers.
 output_headers           True if you want the headers from the
                          response to also be output.
+only_different           True if you only want to perform full
+                         downloads on files where the etag differs
+                         from the one in the target path on the local
+                         filesystem
+only_newer               Same as only_different but where file modified
+                         times are compared (when both are specified, the
+                         file must be both newer and different to download)
 query                    A dict of query parameters to send. Of
                          important use are limit, delimiter, prefix,
                          marker, and end_marker as they are common
@@ -70,10 +77,35 @@ import six
 import os
 import time
 
+from hashlib import md5
+
 from swiftly.cli.command import CLICommand, ReturnCode
 from swiftly.concurrency import Concurrency
 from swiftly.dencrypt import AES256CBC, aes_decrypt
 from swiftly.filelikeiter import FileLikeIter
+
+
+def cli_get_file_hash(path):
+    hash = md5()
+    chunk_size = 1024 * 64
+    with open(path, 'rb') as file:
+        while True:
+            chunk = file.read(chunk_size)
+            if not chunk:
+                break
+            hash.update(chunk)
+
+    return hash.hexdigest()
+
+
+def cli_get_mtime_from_headers(headers):
+    mtime = 0
+    if 'x-object-meta-mtime' in headers:
+        mtime = float(headers['x-object-meta-mtime'])
+    elif 'last-modified' in headers:
+        mtime = time.mktime(time.strptime(
+            headers['last-modified'], '%a, %d %b %Y %H:%M:%S %Z'))
+    return mtime
 
 
 def cli_get_account_listing(context):
@@ -227,12 +259,40 @@ def cli_get_container_listing(context, path=None):
                     del new_context.query[remove]
             for item in contents:
                 if 'name' in item:
+                    new_path = path + '/' + item['name'].encode('utf8')
+                    if context.only_newer or context.only_different:
+                        container, client_path = new_path.split('/', 1)
+                        os_path = context.io_manager.client_path_to_os_path(client_path)
+                        local_file = context.io_manager._get_path(context.io_manager.stdout_root, os_path)
+                        if os.path.isfile(local_file):
+                            should_download = True
+                            if context.only_newer:
+                                local_modified = os.stat(local_file).st_mtime
+                                status, _, headers, _ = client.head_object(container, client_path,
+                                   headers=context.headers, query=context.query, cdn=context.cdn)
+                                if status == 200:
+                                    remote_modified = cli_get_mtime_from_headers(headers)
+                                    if remote_modified:
+                                        if context.io_manager.verbose:
+                                            context.io_manager.verbose("Local modified time is %f, remote is %f" % (
+                                                local_modified, remote_modified))
+                                        should_download = local_modified < remote_modified
+                            if context.only_different and should_download:
+                                local_hash = cli_get_file_hash(local_file)
+                                remote_hash = item['hash']
+                                if context.io_manager.verbose:
+                                    context.io_manager.verbose(
+                                        "Local hash is %s, remote is %s" % (local_hash, remote_hash))
+                                should_download = remote_hash != local_hash
+                            if not should_download:
+                                if context.io_manager.verbose:
+                                    context.io_manager.verbose("Will skip %s" % client_path)
+                                continue
                     for (exc_type, exc_value, exc_tb, result) in \
                             six.itervalues(conc.get_results()):
                         if exc_value:
                             conc.join()
                             raise exc_value
-                    new_path = path + '/' + item['name'].encode('utf8')
                     conc.spawn(new_path, cli_get, new_context, new_path)
         else:
             with context.io_manager.with_stdout() as fp:
@@ -265,7 +325,7 @@ def cli_get_container_listing(context, path=None):
                     'listing container %r: %s %s' % (path, status, reason))
     conc.join()
     for (exc_type, exc_value, exc_tb, result) in \
-        six.itervalues(conc.get_results()):
+            six.itervalues(conc.get_results()):
         if exc_value:
             raise exc_value
 
@@ -324,12 +384,7 @@ def cli_get(context, path=None):
                     headers.get('content-length') == '0'):
                 os.unlink(disk_path)
                 os.makedirs(disk_path)
-            mtime = 0
-            if 'x-object-meta-mtime' in headers:
-                mtime = float(headers['x-object-meta-mtime'])
-            elif 'last-modified' in headers:
-                mtime = time.mktime(time.strptime(
-                    headers['last-modified'], '%a, %d %b %Y %H:%M:%S %Z'))
+            mtime = cli_get_mtime_from_headers(headers)
             if mtime:
                 os.utime(disk_path, (mtime, mtime))
 
@@ -467,6 +522,16 @@ Outputs the resulting contents from a GET request of the [path] given. If no
                  'conjunction with --sub-command so you are left only with '
                  'the files that generated output.')
         self.option_parser.add_option(
+            '--newer', dest='only_newer',
+            action='store_true',
+            help='Only downloads files where the modified time is after the '
+                 'modify time of the local file')
+        self.option_parser.add_option(
+            '--different', dest='only_different',
+            action='store_true',
+            help='Only downloads files where the file hash is different to '
+                 'the local file')
+        self.option_parser.add_option(
             '--decrypt', dest='decrypt', metavar='KEY',
             help='Will decrypt the downloaded object data with KEY. This '
                  'currently only supports AES 256 in CBC mode but other '
@@ -492,6 +557,8 @@ Outputs the resulting contents from a GET request of the [path] given. If no
         context.all_objects = options.all_objects
         context.full = options.full
         context.remove_empty_files = options.remove_empty_files
+        context.only_newer = options.only_newer
+        context.only_different = options.only_different
         if options.limit:
             context.query['limit'] = int(options.limit)
         if options.delimiter:

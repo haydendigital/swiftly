@@ -266,6 +266,7 @@ class IOManager(object):
             object is an actual file that will be closed,
             disk_closed_callback (if set) will be called with the
             on-disk path just after closing it.
+            ut
         """
         sub_command = None if skip_sub_command else self.stdout_sub_command
         out, path = self._get_out_and_path(
